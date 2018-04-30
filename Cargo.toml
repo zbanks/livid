@@ -1,0 +1,10 @@
+[package]
+name = "livid"
+version = "0.1.0"
+authors = ["Zach Banks <zjbanks@gmail.com>"]
+
+[dependencies]
+dlopen = "0.1"
+dlopen_derive = "0.1"
+inotify = "0.4"
+nix = "0.10.0"
