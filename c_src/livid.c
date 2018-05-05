@@ -1,11 +1,3 @@
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
 
 #include "livid.h"
 
@@ -40,37 +32,6 @@ const struct column * columns = _columns;
 //    columns_count = _columns_count;
 //    columns = _columns;
 //}
-
-static void
-api_printf(struct api * const api, const char * const fmt, ...) {
-    va_list vargs;
-    va_start(vargs, fmt);
-    int len = vsnprintf(NULL, 0, fmt, vargs) + 1;
-    if (len < 0) return;
-
-    static char * buf = NULL;
-    static size_t buflen = 0;
-    if (buflen < (size_t) len) {
-        size_t new_buflen = (size_t) len * 2;
-        char * new_buf = realloc(buf, new_buflen);
-        if(!new_buf) {
-            fprintf(stderr, "Unable to realloc %zu bytes for api_printf", new_buflen);
-            return;
-        }
-        buf = new_buf;
-        buflen = new_buflen;
-    }
-
-    va_end(vargs);
-    va_start(vargs, fmt);
-    vsnprintf(buf, buflen, fmt, vargs);
-    va_end(vargs);
-
-    buf[buflen-1] = '\0';
-    api->write(api, buf);
-}
-
-#define printf(...) api_printf(api, ## __VA_ARGS__)
 
 void
 run(struct api * api) {
