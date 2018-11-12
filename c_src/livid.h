@@ -66,8 +66,7 @@ static inline const char * strtype(enum cell_type type) {
 struct column {
     const char * const name;
     enum cell_type cell_type;
-    bool grid_show;
-    size_t grid_width;
+    int16_t grid_width;
 };
 
 struct cell {
@@ -76,23 +75,21 @@ struct cell {
     union cell_value value;
 };
 
-#define SHOW true
-#define HIDE false
 #define CELL_DEREF(cell, type) (cell.PASTE(cell_, _TYPE_LOWER(type)))
-// COLUMN(name, type, hidden)
+#define GRID_WIDTH(n)   (n)
+#define GRID_HIDDEN     -1
+#define GRID_AUTO       0
 
 struct row {
-    #define COLUMN(_NAME, _TYPE, _SHOW) union { _TYPE_CTYPE(_TYPE) _NAME; uint64_t PASTE(_placeholder_, _NAME); };
+    #define COLUMN(_NAME, _TYPE, _GRID_WIDTH) union { _TYPE_CTYPE(_TYPE) _NAME; uint64_t PASTE(_placeholder_, _NAME); };
     COLUMN_LIST
     #undef COLUMN
-};
-struct row_isvalid {
-    #define COLUMN(_NAME, _TYPE, _SHOW) bool _NAME;
+    #define COLUMN(_NAME, _TYPE, _GRID_WIDTH) bool PASTE(_NAME, _empty);
     COLUMN_LIST
     #undef COLUMN
 };
 
-#define COLUMN(_NAME, _TYPE, _SHOW) (struct column) { .name = STRINGIFY(_NAME), .cell_type = PASTE(TYPE_, _TYPE), .grid_show = _SHOW, .grid_width = 10},
+#define COLUMN(_NAME, _TYPE, _GRID_WIDTH) (struct column) { .name = STRINGIFY(_NAME), .cell_type = PASTE(TYPE_, _TYPE), .grid_width = _GRID_WIDTH},
 const struct column columns[] = {
     COLUMN_LIST
 };
@@ -102,8 +99,10 @@ const size_t columns_count = sizeof(columns) / sizeof(columns[0]);
 struct api;
 struct api {
     struct cell * (* const next)(struct api * api);
-    void (* const grid)(struct api * api, const struct cell * cells);
+    int8_t (* const grid)(struct api * api, const struct cell * cells);
     void (* const write)(struct api * api, const char * str);
+
+    char _rust_owned_data[];
 };
 
 // Exports

@@ -3,7 +3,8 @@ extern crate dlopen;
 #[macro_use]
 extern crate dlopen_derive;
 use dlopen::wrapper::{Container, WrapperApi};
-//use dlopen::symbor::{Library, Symbol, RefMut, SymBorApi};
+extern crate libc;
+extern crate inotify;
 
 use std::fs;
 use std::fmt;
@@ -14,8 +15,10 @@ use std::io::{BufRead, Seek, SeekFrom, Write};
 use std::ffi::{CStr, CString};
 use std::path;
 use std::process::{Command, Stdio};
-use std::os::unix::process::CommandExt;
+use std::thread;
+//use std::os::unix::process::CommandExt;
 use std::marker::PhantomData;
+use std::os::unix::io::AsRawFd;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -28,11 +31,11 @@ enum CellType {
 
 impl CellType {
     fn upper_str(self: &Self) -> &'static str {
-        match self {
-            Text => "TEXT",
-            Long => "LONG",
-            Time => "TIME",
-            Double => "DOUBLE",
+        match *self {
+            CellType::Text => "TEXT",
+            CellType::Long => "LONG",
+            CellType::Time => "TIME",
+            CellType::Double => "DOUBLE",
         }
     }
 }
@@ -57,8 +60,7 @@ union CellValue<'v> {
 struct CColumn {
     name: *const char,
     cell_type: CellType,
-    grid_show: bool,
-    grid_width: usize,
+    grid_width: i16,
 }
 
 #[derive(Debug)]
@@ -84,6 +86,34 @@ impl<'val> fmt::Debug for CStrPtr<'val> {
         }
     }
 }
+
+fn const_char_to_string(ptr: *const char) -> String {
+    unsafe { CStr::from_ptr(ptr as *const i8) }.to_str().unwrap().to_string()
+}
+
+impl<'val> CStrPtr<'val> {
+    fn to_string(&'val self) -> String {
+        unsafe { CStr::from_ptr(self.ptr) }.to_str().unwrap().to_string()
+    }
+}
+
+impl<'col, 'val> Cell<'col, 'val> {
+    fn as_str(&self) -> String {
+        if self.empty {
+            String::from("")
+        } else {
+            unsafe {
+                match self.column.cell_type {
+                    CellType::Text => self.value.text.to_string(),
+                    CellType::Long => self.value.long.to_string(),
+                    CellType::Time => self.value.time.to_string(),  // TODO
+                    CellType::Double => self.value.double.to_string(),
+                }
+            }
+        }
+    }
+}
+
 impl<'col, 'val> fmt::Debug for Cell<'col, 'val> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.empty {
@@ -141,7 +171,6 @@ trait InputTable<'a> {
     fn load_output_columns(&'a mut self, output_columns: Vec<CColumn>);
     fn next(&'a mut self) -> Option<Vec<Cell<'a, 'a>>>;
     fn reset(&'a mut self);
-    fn grid(&'a mut self, cells: &'a [Cell<'a, 'a>]);
 }
 
 #[derive(Debug)]
@@ -233,18 +262,15 @@ impl<'a> InputTable<'a> for InputFile {
             .seek(SeekFrom::Start(self.first_line_offset))
             .unwrap();
     }
-
-    fn grid(&'a mut self, cells: &'a [Cell<'a, 'a>]) {
-        println!(" GRID: {:?}", cells);
-    }
 }
 
 #[repr(C)]
 struct LividApi<'a> {
     next: extern "C" fn(api: *mut LividApi<'a>) -> *mut Cell<'a, 'a>,
-    grid: extern "C" fn(api: *mut LividApi<'a>, cells: *const Cell<'a, 'a>) -> (),
+    grid: extern "C" fn(api: *mut LividApi<'a>, cells: *const Cell<'a, 'a>) -> i8,
     write: extern "C" fn(api: *mut LividApi<'a>, string: *const i8) -> (),
     input: &'a mut InputFile,
+    editor: &'a mut Editor,
 }
 
 extern "C" fn livid_api_raw_next<'a>(api: *mut LividApi<'a>) -> *mut Cell<'a, 'a> {
@@ -256,24 +282,27 @@ extern "C" fn livid_api_raw_next<'a>(api: *mut LividApi<'a>) -> *mut Cell<'a, 'a
     }
 }
 
-extern "C" fn livid_api_raw_grid<'a>(api: *mut LividApi<'a>, cells: *const Cell<'a, 'a>) -> () {
+extern "C" fn livid_api_raw_grid<'a>(api: *mut LividApi<'a>, cells: *const Cell<'a, 'a>) -> i8 {
     unsafe {
         let cell_slice = slice::from_raw_parts(cells, (*api).input.output_columns.len());
-        (*api).input.grid(cell_slice)
+        (*api).editor.grid(cell_slice).map(|x| x as i8).unwrap_or(-1)
     }
 }
 
-extern "C" fn livid_api_raw_write<'a>(_api: *mut LividApi<'a>, string: *const i8) -> () {
-    print!("{}", unsafe { CStr::from_ptr(string) }.to_str().unwrap());
+extern "C" fn livid_api_raw_write<'a>(api: *mut LividApi<'a>, string: *const i8) -> () {
+    unsafe {
+        (*api).editor.write(CStr::from_ptr(string).to_str().unwrap()).unwrap()
+    }
 }
 
 impl<'a> LividApi<'a> {
-    fn new(input: &'a mut InputFile) -> Self {
+    fn new(input: &'a mut InputFile, editor: &'a mut Editor) -> Self {
         LividApi {
             next: livid_api_raw_next,
             grid: livid_api_raw_grid,
             write: livid_api_raw_write,
             input: input,
+            editor: editor,
         }
     }
 }
@@ -288,12 +317,25 @@ struct LividLib<'a> {
     run: extern "C" fn(api: &'a LividApi<'a>) -> (),
 }
 
+fn redirect_stdio(target_fd: std::os::unix::io::RawFd) {
+    unsafe {
+        libc::close(1);
+        libc::dup(target_fd);
+        libc::close(2);
+        libc::dup(target_fd);
+    }
+}
+
 struct Editor {
     workspace: path::PathBuf,
     vimrc_path: path::PathBuf,
     script_file: File,
     log_file: File,
     output_file: File,
+    script_notify: inotify::Inotify,
+    grid_rows: usize,
+    grid_rows_limit: usize,
+    auto_widths: Vec<usize>,
 }
 
 impl Editor {
@@ -302,13 +344,18 @@ impl Editor {
         fs::create_dir_all(&workspace)?;
 
         let script_file_path = workspace.join("script.c");
-        let mut script_file = File::create(&script_file_path)?;
+        let script_file = File::create(&script_file_path)?;
+        let mut script_notify = inotify::Inotify::init()?;
+        script_notify.add_watch(
+            script_file_path.clone(),
+            inotify::WatchMask::CLOSE_WRITE
+        )?;
 
         let log_file_path = workspace.join("log");
-        let mut log_file = File::create(&log_file_path)?;
+        let log_file = File::create(&log_file_path)?;
 
         let output_file_path = workspace.join("output");
-        let mut output_file = File::create(&output_file_path)?;
+        let output_file = File::create(&output_file_path)?;
 
         let vimrc_path = workspace.join("vimrc");
         {
@@ -321,29 +368,38 @@ impl Editor {
             write!(vimrc, "vsplit {}\n", script_file_path.to_str().unwrap())?;
         }
 
+        redirect_stdio(log_file.as_raw_fd());
+
         Ok(Editor {
             workspace: workspace,
             vimrc_path: vimrc_path,
             script_file: script_file,
+            script_notify: script_notify,
             log_file: log_file,
             output_file: output_file,
+            grid_rows: 0,
+            grid_rows_limit: 20,
+            auto_widths: vec![],
         })
     }
 
-    fn launch(&mut self) -> std::io::Result<()> {
+    fn launch(&mut self) -> std::io::Result<thread::JoinHandle<()>> {
         let vim_stdin = File::open("/dev/tty")?;
         let vim_stdout = File::create("/dev/tty")?;
         let vim_stderr = self.log_file.try_clone()?;
-        Command::new("vim")
-            .arg("--servername")
-            .arg("livid")
-            .arg("-S")
-            .arg(self.vimrc_path.as_os_str())
-            .stdin(Stdio::from(vim_stdin))
-            .stdout(Stdio::from(vim_stdout))
-            .stderr(Stdio::from(vim_stderr))
-            .status();
-        Ok(())
+        let vimrc_path = self.vimrc_path.clone();
+        Ok(thread::spawn(move || {
+            Command::new("vim")
+                .arg("--servername")
+                .arg("livid")
+                .arg("-S")
+                .arg(vimrc_path.as_os_str())
+                .stdin(Stdio::from(vim_stdin))
+                .stdout(Stdio::from(vim_stdout))
+                .stderr(Stdio::from(vim_stderr))
+                .status()
+                .unwrap();
+        }))
     }
 
     fn reload(&mut self) -> std::io::Result<()> {
@@ -353,7 +409,7 @@ impl Editor {
             .arg("livid")
             .arg("--remote-send")
             .arg("<Esc>:checktime<CR>")
-            .status();
+            .status()?;
         Ok(())
     }
 
@@ -374,45 +430,122 @@ impl Editor {
             .arg("-o")
             .arg(&lib_path)
             .arg(self.workspace.join("script.c"))
-            .status();
+            .stderr(self.log_file.try_clone()?)
+            .status()?;
         Ok(lib_path)
+    }
+
+    fn grid(&mut self, cells: &[Cell]) -> std::io::Result<bool> {
+        if self.auto_widths.len() < cells.len() {
+            self.auto_widths.resize(cells.len(), 0);
+        }
+        if self.grid_rows == 0 {
+            for (cell, auto_width) in cells.iter().zip(self.auto_widths.iter_mut()) {
+                let grid_width = cell.column.grid_width;
+                let width = if grid_width < 0 {
+                    continue;
+                } else if grid_width == 0 {
+                    *auto_width
+                } else {
+                    grid_width as usize
+                };
+                let string_value = const_char_to_string(cell.column.name);
+                write!(self.output_file, "| {val:>width$} ", width=width, val=string_value)?;
+                *auto_width = std::cmp::max(*auto_width, string_value.len());
+            }
+            write!(self.output_file, "|\n")?;
+
+            for (cell, auto_width) in cells.iter().zip(self.auto_widths.iter_mut()) {
+                let grid_width = cell.column.grid_width;
+                let width = if grid_width < 0 {
+                    continue;
+                } else if grid_width == 0 {
+                    *auto_width
+                } else {
+                    grid_width as usize
+                };
+                let dashes = "-".repeat(width + 2);
+                write!(self.output_file, "+{}", dashes)?;
+            }
+            write!(self.output_file, "+\n")?;
+        }
+        self.grid_rows += 1;
+        if self.grid_rows >= self.grid_rows_limit {
+            return Ok(true)
+        }
+        for (cell, auto_width) in cells.iter().zip(self.auto_widths.iter_mut()) {
+            let grid_width = cell.column.grid_width;
+            let width = if grid_width < 0 {
+                continue;
+            } else if grid_width == 0 {
+                *auto_width
+            } else {
+                grid_width as usize
+            };
+            let string_value = cell.as_str();
+            write!(self.output_file, "| {val:>width$} ", width=width, val=string_value)?;
+            *auto_width = std::cmp::max(*auto_width, string_value.len());
+        }
+        write!(self.output_file, "|\n")?;
+        Ok(false)
+    }
+
+    fn write(&mut self, string: &str) -> std::io::Result<()> {
+        write!(self.output_file, "{}", string)?;
+        Ok(())
+    }
+
+    fn reset_output(&mut self) -> std::io::Result<()> {
+        self.output_file.set_len(0)?;
+        self.output_file.seek(std::io::SeekFrom::Start(0))?;
+        self.grid_rows = 0;
+        Ok(())
     }
 }
 
-fn run_livid(mut editor: Editor, mut input: InputFile) -> () {
-    generate_script(&mut editor.script_file, input.input_columns()).unwrap();
-    //editor.launch().unwrap();
+fn run_livid(mut editor: Editor, mut input: InputFile) -> std::io::Result<()> {
+    generate_script(&mut editor.script_file, input.input_columns())?;
+    let _editor_jh = editor.launch()?;
+    loop {
+        editor.reset_output()?;
+        let lib_path = editor.compile()?;
 
-    editor.output_file.set_len(0).unwrap();
-    let lib_path = editor.compile().unwrap();
+        println!("Compiled: {:?}", lib_path);
+        {
+            let api = LividApi::new(&mut input, &mut editor);
+            let container: Container<LividLib> = unsafe { Container::load(lib_path) }.unwrap();
+            println!(
+                "Loaded container: {:?} {:?}",
+                container.columns, container.columns_count
+            );
 
-    println!("Compiled: {:?}", lib_path);
-    let api = LividApi::new(&mut input);
-    let container: Container<LividLib> = unsafe { Container::load(lib_path) }.unwrap();
-    println!(
-        "Loaded container: {:?} {:?}",
-        container.columns, container.columns_count
-    );
+            let output_columns =
+                unsafe { slice::from_raw_parts(container.columns, *container.columns_count) }.to_vec();
+            println!("Columns: {:?}", output_columns);
+            api.input.load_output_columns(output_columns);
+            api.input.reset();
+            container.run(&api);
+        }
 
-    let output_columns =
-        unsafe { slice::from_raw_parts(container.columns, *container.columns_count) }.to_vec();
-    println!("Columns: {:?}", output_columns);
-    api.input.load_output_columns(output_columns);
-    api.input.reset();
-    container.run(&api);
+        println!("reloaded");
+        editor.reload().unwrap();
 
-    editor.reload().unwrap();
+        let mut buffer = [0; 1024];
+        let _events = editor.script_notify.read_events_blocking(&mut buffer);
+    }
 }
 
 fn generate_script(file: &mut File, columns: &Vec<Column>) -> std::io::Result<()> {
     file.set_len(0)?;
-    write!(file, "#define COLUMN_LIST \\\n");
+    write!(file, "#define COLUMN_LIST \\\n")?;
+    write!(file, "    /*     {:16}  {:10}  {:10} */\\\n", "column name", "type", "grid width")?;
     for column in columns {
         write!(
             file,
-            "    COLUMN({:16}, {:6}, SHOW) \\\n",
+            "    COLUMN({:16}, {:10}, {:10}) \\\n",
             column.name.to_str().unwrap(),
-            column.cell_type.upper_str()
+            column.cell_type.upper_str(),
+            "GRID_AUTO"
         )?;
     }
     write!(file, "\n")?;
@@ -420,6 +553,9 @@ fn generate_script(file: &mut File, columns: &Vec<Column>) -> std::io::Result<()
     write!(file, "#include \"livid.h\"\n")?;
     file.write_all(
         br#"
+// TEXT, LONG, TIME, DOUBLE
+// GRID_AUTO, GRID_HIDDEN, GRID_WIDTH(12)
+
 void run(struct api * api) {
     /*
     write("%%zu %%zu %%zu", columns_cnt, sizeof(columns), sizeof(columns[0]));
@@ -436,10 +572,10 @@ void run(struct api * api) {
         for (size_t i = 0; i < columns_count; i++) {
             //printf(" > %zu %zu %s %d\n",
             //       i, columns[i].index, columns[i].name, columns[i].cell_type);
-            printf("[%zu %s %d] = '%s', ",
-                    i, columns[i].name, columns[i].cell_type, cells[i].value.cell_text);
+            //printf("[%zu %s %d] = '%s', ",
+            //        i, columns[i].name, columns[i].cell_type, cells[i].value.cell_text);
         }
-        printf("\n");
+        //printf("\n");
         api->grid(api, cells);
     }
 }
@@ -454,11 +590,11 @@ fn main() {
     //let stdin = io::stdin();
     //let mut stdin_lock = stdin.lock();
 
-    let mut editor = Editor::new().unwrap();
-    let mut input = InputFile::new(path::Path::new("test.csv")).unwrap();
+    let editor = Editor::new().unwrap();
+    let input = InputFile::new(path::Path::new("test.csv")).unwrap();
 
     println!("Header: {:#?}", input.input_columns());
     //println!("Row: {:#?}", input.next());
 
-    run_livid(editor, input);
+    run_livid(editor, input).unwrap();
 }
