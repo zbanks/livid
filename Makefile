@@ -7,7 +7,10 @@ CFLAGS = -std=c11 -Wall -Wextra -Wconversion -Werror -D_POSIX_C_SOURCE=201804L -
 CFLAGS += -ggdb3 -O0
 #CFLAGS += -O3
 
-liblivid.so: src/livid.c src/optim.c
+src/livid.h.inc: src/livid.h
+	xxd -i $< $@
+
+liblivid.so: src/livid.c src/livid_reader.c src/livid_editor.c src/optim.c | src/livid.h.inc src/livid.h
 	$(CC) $(CFLAGS) $^ -shared -fPIC -ldl -o $@
 
 livid: liblivid.so
@@ -15,7 +18,7 @@ livid: liblivid.so
 
 .PHONY: clean
 clean:
-	-rm -f *.o $(TARGET)
+	-rm -f *.o *.so $(TARGET) src/livid.h.inc
 
 .PHONY: all
 all: $(TARGET)
