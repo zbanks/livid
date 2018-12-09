@@ -3,22 +3,31 @@ extern crate dlopen;
 #[macro_use]
 extern crate dlopen_derive;
 use dlopen::wrapper::{Container, WrapperApi};
-extern crate libc;
 extern crate inotify;
+extern crate libc;
 
-use std::fs;
+use std::ffi::{CStr, CString};
 use std::fmt;
-use std::slice;
+use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::{BufRead, Seek, SeekFrom, Write};
-use std::ffi::{CStr, CString};
 use std::path;
 use std::process::{Command, Stdio};
+use std::slice;
+use std::str::FromStr;
 use std::thread;
 //use std::os::unix::process::CommandExt;
+use std::default::Default;
 use std::marker::PhantomData;
+use std::os::raw::c_char;
 use std::os::unix::io::AsRawFd;
+// TODO:
+//  Change Cell API. Should return a struct of values (or values + empty bools)
+//  Right now it returns list of Cells which doesn't translate to C well
+// TODO: non-zero default values for numerics
+// TODO: parse time, time fns
+// TODO: serialize stdin back out to workspace?
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -47,6 +56,15 @@ struct CStrPtr<'v> {
     phantom: PhantomData<&'v i8>,
 }
 
+impl<'a> CStrPtr<'a> {
+    fn from(s: &'a CString) -> CStrPtr<'a> {
+        CStrPtr {
+            ptr: s.as_ptr(),
+            phantom: PhantomData,
+        }
+    }
+}
+
 #[repr(C)]
 union CellValue<'v> {
     text: CStrPtr<'v>,
@@ -58,9 +76,50 @@ union CellValue<'v> {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct CColumn {
-    name: *const char,
+    name: *const c_char,
     cell_type: CellType,
     grid_width: i16,
+}
+
+impl CColumn {
+    fn empty_value<'c>(&'c self) -> Cell<'c, 'c> {
+        Cell {
+            column: self,
+            empty: true,
+            value: CellValue { long: 0 },
+        }
+    }
+    fn parse_value<'v, 'c: 'v>(&'c self, v: &'v CString) -> Cell<'c, 'v> {
+        let op_value = match self.cell_type {
+            CellType::Text => Some(CellValue {
+                text: CStrPtr::from(v),
+            }),
+            CellType::Long => v
+                .to_str()
+                .ok()
+                .and_then(|x| i64::from_str(x).ok())
+                .map(|x| CellValue { long: x }),
+            CellType::Time => v
+                .to_str()
+                .ok()
+                .and_then(|x| i64::from_str(x).ok())
+                .map(|x| CellValue { time: x }),
+            CellType::Double => v
+                .to_str()
+                .ok()
+                .and_then(|x| f64::from_str(x).ok())
+                .map(|x| CellValue { double: x }),
+        };
+        if let Some(value) = op_value {
+            Cell {
+                column: self,
+                empty: false,
+                value: value,
+            }
+        } else {
+            self.empty_value()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -79,21 +138,24 @@ struct Cell<'col, 'val> {
 
 impl<'val> fmt::Debug for CStrPtr<'val> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        unsafe {
-            // CStr uses `*const i8`, CString uses `*const u8`
-            //let i8_ptr = std::mem::transmute::<*const u8, *const i8>(self.ptr);
-            write!(f, "{:?}", CStr::from_ptr(self.ptr))
-        }
+        write!(f, "{:?}", unsafe { const_char_cstr(self.ptr) })
     }
 }
 
-fn const_char_to_string(ptr: *const char) -> String {
-    unsafe { CStr::from_ptr(ptr as *const i8) }.to_str().unwrap().to_string()
+unsafe fn const_char_cstr<'a>(ptr: *const c_char) -> &'a CStr {
+    if ptr == std::ptr::null() {
+        Default::default()
+    } else {
+        CStr::from_ptr(ptr)
+    }
 }
 
 impl<'val> CStrPtr<'val> {
     fn to_string(&'val self) -> String {
-        unsafe { CStr::from_ptr(self.ptr) }.to_str().unwrap().to_string()
+        unsafe { const_char_cstr(self.ptr) }
+            .to_str()
+            .unwrap()
+            .to_string()
     }
 }
 
@@ -106,7 +168,7 @@ impl<'col, 'val> Cell<'col, 'val> {
                 match self.column.cell_type {
                     CellType::Text => self.value.text.to_string(),
                     CellType::Long => self.value.long.to_string(),
-                    CellType::Time => self.value.time.to_string(),  // TODO
+                    CellType::Time => self.value.time.to_string(), // TODO
                     CellType::Double => self.value.double.to_string(),
                 }
             }
@@ -178,11 +240,13 @@ struct InputFile {
     delimiter: char,
     header: String,
     line: String,
-    first_line_offset: u64,
+    //first_line_offset: u64,
     reader: io::BufReader<File>,
     input_columns: Vec<Column>,
     output_columns: Vec<CColumn>,
-    cells: Vec<CString>,
+    output_input_map: Vec<Option<usize>>,
+    row_index: usize,
+    raw_cells: Vec<Vec<CString>>,
 }
 
 impl InputFile {
@@ -191,7 +255,7 @@ impl InputFile {
         let mut input_reader = io::BufReader::new(input_file);
         let mut header = String::new();
         input_reader.read_line(&mut header)?;
-        let offset = input_reader.seek(SeekFrom::Current(0)).unwrap();
+        let _offset = input_reader.seek(SeekFrom::Current(0)).unwrap();
 
         let delimiter = ',';
         let columns = header
@@ -202,18 +266,19 @@ impl InputFile {
                 name: CString::new(h).unwrap(),
                 index: i,
                 cell_type: CellType::Text,
-            })
-            .collect();
+            }).collect();
 
         return Result::Ok(InputFile {
             delimiter: delimiter,
             header: header.trim().to_string(),
             line: String::new(),
-            first_line_offset: offset,
+            //first_line_offset: offset,
             reader: input_reader,
             input_columns: columns,
+            output_input_map: vec![],
             output_columns: vec![],
-            cells: vec![],
+            row_index: 0,
+            raw_cells: vec![],
         });
     }
 }
@@ -225,42 +290,99 @@ impl<'a> InputTable<'a> for InputFile {
 
     fn load_output_columns(&'a mut self, output_columns: Vec<CColumn>) {
         self.output_columns = output_columns;
+        self.output_input_map = self
+            .output_columns
+            .iter()
+            .map(|oc| {
+                self.input_columns
+                    .iter()
+                    .find(|ic| ic.name.as_c_str() == unsafe { const_char_cstr(oc.name) })
+                    .map(|ic| ic.index)
+            }).collect();
     }
 
     fn next(&'a mut self) -> Option<Vec<Cell<'a, 'a>>> {
+        let raw_cells = &mut self.raw_cells;
+        let line_buf = &mut self.line;
+        let delimiter = self.delimiter;
+        let reader = &mut self.reader;
+        let input_len = self.input_columns.len();
+        let output_input_map: &Vec<_> = &self.output_input_map;
+        let output_columns = &self.output_columns;
+        let raw_row = if raw_cells.len() > self.row_index {
+            raw_cells.get(self.row_index)
+        } else {
+            line_buf.clear();
+            reader.read_line(line_buf).ok().and_then(move |rc| {
+                if rc <= 0 {
+                    return None;
+                }
+                let mut l: Vec<CString> = line_buf
+                    .trim()
+                    .split(delimiter)
+                    .map(|s| CString::new(s).unwrap())
+                    .collect();
+                l.resize(input_len, CString::default());
+                raw_cells.push(l);
+                raw_cells.last()
+            })
+        }?;
+        self.row_index += 1;
+        Some(
+            output_input_map
+                .iter()
+                .zip(output_columns.iter())
+                .map(|(opt_idx, col)| {
+                    opt_idx
+                        .and_then(|x| raw_row.get(x))
+                        .map(|x| col.parse_value(x))
+                        .unwrap_or(col.empty_value())
+                }).collect(),
+        )
+
+        /*
         self.line.clear();
         let rc = self.reader.read_line(&mut self.line);
         if rc.is_ok() && rc.unwrap() > 0 {
+            Some(
+            self.line
+                .trim()
+                .split(self.delimiter)
+                .zip(&self.output_columns)
+                .map(|(s, c)| {
+                    let (r, cs) = c.parse_value(s);
+                    if let Some(csp) = cs { self.cells.push(csp); }
+                    r
+                })
+                .collect()
+            )
+            /*
             self.cells = self.line
                 .trim()
                 .split(self.delimiter)
                 .map(|s| CString::new(s).unwrap())
                 .collect();
-            return Option::Some(
+            Some(
                 self.cells
                     .iter()
                     .zip(&self.output_columns)
-                    .map(|(s, c)| Cell {
-                        column: &c,
-                        empty: false,
-                        value: CellValue {
-                            text: CStrPtr {
-                                ptr: s.as_ptr(),
-                                phantom: PhantomData,
-                            },
-                        },
-                    })
+                    .map(|(s, c)| c.parse_value(s))
                     .collect(),
-            );
+            )
+            */
         } else {
-            return Option::None;
+            None
         }
+        */
     }
 
     fn reset(&'a mut self) {
+        /*
         self.reader
             .seek(SeekFrom::Start(self.first_line_offset))
             .unwrap();
+        */
+        self.row_index = 0;
     }
 }
 
@@ -285,13 +407,20 @@ extern "C" fn livid_api_raw_next<'a>(api: *mut LividApi<'a>) -> *mut Cell<'a, 'a
 extern "C" fn livid_api_raw_grid<'a>(api: *mut LividApi<'a>, cells: *const Cell<'a, 'a>) -> i8 {
     unsafe {
         let cell_slice = slice::from_raw_parts(cells, (*api).input.output_columns.len());
-        (*api).editor.grid(cell_slice).map(|x| x as i8).unwrap_or(-1)
+        (*api)
+            .editor
+            .grid(cell_slice)
+            .map(|x| x as i8)
+            .unwrap_or(-1)
     }
 }
 
 extern "C" fn livid_api_raw_write<'a>(api: *mut LividApi<'a>, string: *const i8) -> () {
     unsafe {
-        (*api).editor.write(CStr::from_ptr(string).to_str().unwrap()).unwrap()
+        (*api)
+            .editor
+            .write(const_char_cstr(string).to_str().unwrap())
+            .unwrap()
     }
 }
 
@@ -346,10 +475,7 @@ impl Editor {
         let script_file_path = workspace.join("script.c");
         let script_file = File::create(&script_file_path)?;
         let mut script_notify = inotify::Inotify::init()?;
-        script_notify.add_watch(
-            script_file_path.clone(),
-            inotify::WatchMask::CLOSE_WRITE
-        )?;
+        script_notify.add_watch(script_file_path.clone(), inotify::WatchMask::CLOSE_WRITE)?;
 
         let log_file_path = workspace.join("log");
         let log_file = File::create(&log_file_path)?;
@@ -449,8 +575,15 @@ impl Editor {
                 } else {
                     grid_width as usize
                 };
-                let string_value = const_char_to_string(cell.column.name);
-                write!(self.output_file, "| {val:>width$} ", width=width, val=string_value)?;
+                let string_value = unsafe { const_char_cstr(cell.column.name) }
+                    .to_str()
+                    .unwrap();
+                write!(
+                    self.output_file,
+                    "| {val:>width$} ",
+                    width = width,
+                    val = string_value
+                )?;
                 *auto_width = std::cmp::max(*auto_width, string_value.len());
             }
             write!(self.output_file, "|\n")?;
@@ -471,7 +604,7 @@ impl Editor {
         }
         self.grid_rows += 1;
         if self.grid_rows >= self.grid_rows_limit {
-            return Ok(true)
+            return Ok(true);
         }
         for (cell, auto_width) in cells.iter().zip(self.auto_widths.iter_mut()) {
             let grid_width = cell.column.grid_width;
@@ -483,7 +616,12 @@ impl Editor {
                 grid_width as usize
             };
             let string_value = cell.as_str();
-            write!(self.output_file, "| {val:>width$} ", width=width, val=string_value)?;
+            write!(
+                self.output_file,
+                "| {val:>width$} ",
+                width = width,
+                val = string_value
+            )?;
             *auto_width = std::cmp::max(*auto_width, string_value.len());
         }
         write!(self.output_file, "|\n")?;
@@ -498,6 +636,8 @@ impl Editor {
     fn reset_output(&mut self) -> std::io::Result<()> {
         self.output_file.set_len(0)?;
         self.output_file.seek(std::io::SeekFrom::Start(0))?;
+        self.log_file.set_len(0)?;
+        self.log_file.seek(std::io::SeekFrom::Start(0))?;
         self.grid_rows = 0;
         Ok(())
     }
@@ -520,7 +660,8 @@ fn run_livid(mut editor: Editor, mut input: InputFile) -> std::io::Result<()> {
             );
 
             let output_columns =
-                unsafe { slice::from_raw_parts(container.columns, *container.columns_count) }.to_vec();
+                unsafe { slice::from_raw_parts(container.columns, *container.columns_count) }
+                    .to_vec();
             println!("Columns: {:?}", output_columns);
             api.input.load_output_columns(output_columns);
             api.input.reset();
@@ -538,7 +679,11 @@ fn run_livid(mut editor: Editor, mut input: InputFile) -> std::io::Result<()> {
 fn generate_script(file: &mut File, columns: &Vec<Column>) -> std::io::Result<()> {
     file.set_len(0)?;
     write!(file, "#define COLUMN_LIST \\\n")?;
-    write!(file, "    /*     {:16}  {:10}  {:10} */\\\n", "column name", "type", "grid width")?;
+    write!(
+        file,
+        "    /*     {:16}  {:10}  {:10} */\\\n",
+        "column name", "type", "grid width"
+    )?;
     for column in columns {
         write!(
             file,
