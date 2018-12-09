@@ -17,11 +17,11 @@ use std::process::{Command, Stdio};
 use std::slice;
 use std::str::FromStr;
 use std::thread;
-//use std::os::unix::process::CommandExt;
 use std::default::Default;
 use std::marker::PhantomData;
 use std::os::raw::c_char;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::io::RawFd;
 // TODO:
 //  Change Cell API. Should return a struct of values (or values + empty bools)
 //  Right now it returns list of Cells which doesn't translate to C well
@@ -66,6 +66,7 @@ impl<'a> CStrPtr<'a> {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 union CellValue<'v> {
     text: CStrPtr<'v>,
     long: i64,
@@ -79,6 +80,23 @@ struct CColumn {
     name: *const c_char,
     cell_type: CellType,
     grid_width: i16,
+}
+
+impl<'v> CellValue<'v> {
+    fn to_string(&self, t: CellType, empty: bool) -> String {
+        if empty {
+            String::from("")
+        } else {
+            unsafe {
+                match t {
+                    CellType::Text => self.text.to_string(),
+                    CellType::Long => self.long.to_string(),
+                    CellType::Time => self.time.to_string(), // TODO
+                    CellType::Double => self.double.to_string(),
+                }
+            }
+        }
+    }
 }
 
 impl CColumn {
@@ -129,12 +147,13 @@ struct Column {
     cell_type: CellType,
 }
 
-#[repr(C)]
 struct Cell<'col, 'val> {
     column: &'col CColumn,
     empty: bool,
     value: CellValue<'val>,
 }
+
+type Row<'col, 'val> = Vec<Cell<'col, 'val>>;
 
 impl<'val> fmt::Debug for CStrPtr<'val> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -388,28 +407,35 @@ impl<'a> InputTable<'a> for InputFile {
 
 #[repr(C)]
 struct LividApi<'a> {
-    next: extern "C" fn(api: *mut LividApi<'a>) -> *mut Cell<'a, 'a>,
-    grid: extern "C" fn(api: *mut LividApi<'a>, cells: *const Cell<'a, 'a>) -> i8,
-    write: extern "C" fn(api: *mut LividApi<'a>, string: *const i8) -> (),
+    next: extern "C" fn(api: *mut LividApi<'a>, row_out: *mut CellValue<'a>, empty_out: *mut i8) -> i8,
+    grid: extern "C" fn(api: *mut LividApi<'a>, row: *const CellValue<'a>, empty: *const i8) -> i8,
+    write: extern "C" fn(api: *mut LividApi<'a>, string: *const c_char) -> (),
     input: &'a mut InputFile,
     editor: &'a mut Editor,
 }
 
-extern "C" fn livid_api_raw_next<'a>(api: *mut LividApi<'a>) -> *mut Cell<'a, 'a> {
+extern "C" fn livid_api_raw_next<'a>(api: *mut LividApi<'a>, row_out: *mut CellValue<'a>, empty_out: *mut i8) -> i8 {
     unsafe {
-        (*api)
-            .input
-            .next()
-            .map_or(std::ptr::null_mut(), |mut v| v.as_mut_ptr())
+        if let Some(row) = (*api).input.next() {
+            for (i, cell) in row.iter().enumerate() {
+                row_out.add(i).write(cell.value.clone());
+                empty_out.add(i).write(cell.empty as i8);
+            }
+            1
+        } else {
+            0
+        }
     }
 }
 
-extern "C" fn livid_api_raw_grid<'a>(api: *mut LividApi<'a>, cells: *const Cell<'a, 'a>) -> i8 {
+extern "C" fn livid_api_raw_grid<'a>(api: *mut LividApi<'a>, row: *const CellValue<'a>, empty: *const i8) -> i8 {
     unsafe {
-        let cell_slice = slice::from_raw_parts(cells, (*api).input.output_columns.len());
-        (*api)
-            .editor
-            .grid(cell_slice)
+        let api = &mut (*api);
+        let columns = &api.input.output_columns;
+        let row_slice = slice::from_raw_parts(row, columns.len());
+        let empty_slice = slice::from_raw_parts(empty, columns.len());
+        api.editor
+            .grid(columns, row_slice, empty_slice)
             .map(|x| x as i8)
             .unwrap_or(-1)
     }
@@ -446,12 +472,36 @@ struct LividLib<'a> {
     run: extern "C" fn(api: &'a LividApi<'a>) -> (),
 }
 
-fn redirect_stdio(target_fd: std::os::unix::io::RawFd) {
-    unsafe {
-        libc::close(1);
-        libc::dup(target_fd);
-        libc::close(2);
-        libc::dup(target_fd);
+struct StdioRedirector {
+    stdout_fd: RawFd,
+    stderr_fd: RawFd,
+}
+impl StdioRedirector {
+    fn new(target_fd: RawFd) -> Self{
+        unsafe {
+            let stdout_fd = libc::dup(1);
+            let stderr_fd = libc::dup(2);
+            libc::close(1);
+            libc::dup(target_fd);
+            libc::close(2);
+            libc::dup(target_fd);
+            StdioRedirector {
+                stdout_fd: stdout_fd,
+                stderr_fd: stderr_fd,
+            }
+        }
+    }
+}
+impl Drop for StdioRedirector {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(1);
+            libc::dup(self.stdout_fd);
+            libc::close(self.stdout_fd);
+            libc::close(2);
+            libc::dup(self.stderr_fd);
+            libc::close(self.stderr_fd);
+        }
     }
 }
 
@@ -465,6 +515,7 @@ struct Editor {
     grid_rows: usize,
     grid_rows_limit: usize,
     auto_widths: Vec<usize>,
+    redirector: StdioRedirector,
 }
 
 impl Editor {
@@ -494,7 +545,7 @@ impl Editor {
             write!(vimrc, "vsplit {}\n", script_file_path.to_str().unwrap())?;
         }
 
-        redirect_stdio(log_file.as_raw_fd());
+        let log_fd = log_file.as_raw_fd();
 
         Ok(Editor {
             workspace: workspace,
@@ -506,6 +557,7 @@ impl Editor {
             grid_rows: 0,
             grid_rows_limit: 20,
             auto_widths: vec![],
+            redirector: StdioRedirector::new(log_fd),
         })
     }
 
@@ -561,13 +613,17 @@ impl Editor {
         Ok(lib_path)
     }
 
-    fn grid(&mut self, cells: &[Cell]) -> std::io::Result<bool> {
-        if self.auto_widths.len() < cells.len() {
-            self.auto_widths.resize(cells.len(), 0);
+    fn grid<'a>(&mut self, columns: &[CColumn], values: &[CellValue<'a>], emptys: &[i8]) -> std::io::Result<bool> {
+        assert!(columns.len() == values.len());
+        assert!(columns.len() == emptys.len());
+
+        if self.auto_widths.len() < columns.len() {
+            self.auto_widths.resize(columns.len(), 0);
         }
         if self.grid_rows == 0 {
-            for (cell, auto_width) in cells.iter().zip(self.auto_widths.iter_mut()) {
-                let grid_width = cell.column.grid_width;
+            for (column, auto_width) in columns.iter()
+                .zip(self.auto_widths.iter_mut()) {
+                let grid_width = column.grid_width;
                 let width = if grid_width < 0 {
                     continue;
                 } else if grid_width == 0 {
@@ -575,7 +631,7 @@ impl Editor {
                 } else {
                     grid_width as usize
                 };
-                let string_value = unsafe { const_char_cstr(cell.column.name) }
+                let string_value = unsafe { const_char_cstr(column.name) }
                     .to_str()
                     .unwrap();
                 write!(
@@ -588,8 +644,9 @@ impl Editor {
             }
             write!(self.output_file, "|\n")?;
 
-            for (cell, auto_width) in cells.iter().zip(self.auto_widths.iter_mut()) {
-                let grid_width = cell.column.grid_width;
+            for (column, auto_width) in columns.iter()
+                .zip(self.auto_widths.iter_mut()) {
+                let grid_width = column.grid_width;
                 let width = if grid_width < 0 {
                     continue;
                 } else if grid_width == 0 {
@@ -606,8 +663,11 @@ impl Editor {
         if self.grid_rows >= self.grid_rows_limit {
             return Ok(true);
         }
-        for (cell, auto_width) in cells.iter().zip(self.auto_widths.iter_mut()) {
-            let grid_width = cell.column.grid_width;
+        for (((column, value), empty), auto_width) in columns.iter()
+            .zip(values.iter())
+            .zip(emptys.iter().map(|x| *x != 0))
+            .zip(self.auto_widths.iter_mut()) {
+            let grid_width = column.grid_width;
             let width = if grid_width < 0 {
                 continue;
             } else if grid_width == 0 {
@@ -615,7 +675,7 @@ impl Editor {
             } else {
                 grid_width as usize
             };
-            let string_value = cell.as_str();
+            let string_value = value.to_string(column.cell_type, empty);
             write!(
                 self.output_file,
                 "| {val:>width$} ",
@@ -702,26 +762,10 @@ fn generate_script(file: &mut File, columns: &Vec<Column>) -> std::io::Result<()
 // GRID_AUTO, GRID_HIDDEN, GRID_WIDTH(12)
 
 void run(struct api * api) {
-    /*
-    write("%%zu %%zu %%zu", columns_cnt, sizeof(columns), sizeof(columns[0]));
-    struct row row;
-    while (next()) {
-        //load_all(&row);
-        //write("a=%%s b=%%s c=%%s", row.a, row.b, row.c);
-        //grid(&row);
-    }
-    */
     printf("hello\n");
-    struct cell * cells = NULL;
-    while ((cells = api->next(api)) != NULL) {
-        for (size_t i = 0; i < columns_count; i++) {
-            //printf(" > %zu %zu %s %d\n",
-            //       i, columns[i].index, columns[i].name, columns[i].cell_type);
-            //printf("[%zu %s %d] = '%s', ",
-            //        i, columns[i].name, columns[i].cell_type, cells[i].value.cell_text);
-        }
-        //printf("\n");
-        api->grid(api, cells);
+    struct row row[1];
+    while (api_next(api, row)) {
+        api_grid(api, row);
     }
 }
 "#,
@@ -735,11 +779,13 @@ fn main() {
     //let stdin = io::stdin();
     //let mut stdin_lock = stdin.lock();
 
-    let editor = Editor::new().unwrap();
-    let input = InputFile::new(path::Path::new("test.csv")).unwrap();
+    {
+        let editor = Editor::new().unwrap();
+        let input = InputFile::new(path::Path::new("test.csv")).unwrap();
 
-    println!("Header: {:#?}", input.input_columns());
-    //println!("Row: {:#?}", input.next());
+        println!("Header: {:#?}", input.input_columns());
+        //println!("Row: {:#?}", input.next());
 
-    run_livid(editor, input).unwrap();
+        run_livid(editor, input)
+    }.unwrap();
 }

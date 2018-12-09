@@ -34,7 +34,7 @@
 #define _TYPE_LOWER_DOUBLE  double
 #define _TYPE_CTYPE(t) PASTE(_TYPE_CTYPE_, t)
 #define _TYPE_LOWER(t) PASTE(_TYPE_LOWER_, t)
-// XXX FIXME: Have rust do the capitalization
+// TODO: Have rust do the capitalization
 #define Text TEXT
 #define Long LONG
 #define Time TIME
@@ -52,7 +52,7 @@ union cell_value {
     TYPE_LIST
     #undef TYPE
 };
-//static_assert(sizeof(union cell) == sizeof(uint64_t));
+//_Static_assert(sizeof(union cell) == sizeof(uint64_t));
 
 static inline const char * strtype(enum cell_type type) {
     switch (type) {
@@ -69,12 +69,6 @@ struct column {
     int16_t grid_width;
 };
 
-struct cell {
-    const struct column * const column;
-    bool empty;
-    union cell_value value;
-};
-
 #define CELL_DEREF(cell, type) (cell.PASTE(cell_, _TYPE_LOWER(type)))
 #define GRID_WIDTH(n)   (n)
 #define GRID_HIDDEN     -1
@@ -84,10 +78,24 @@ struct row {
     #define COLUMN(_NAME, _TYPE, _GRID_WIDTH) union { _TYPE_CTYPE(_TYPE) _NAME; uint64_t PASTE(_placeholder_, _NAME); };
     COLUMN_LIST
     #undef COLUMN
-    #define COLUMN(_NAME, _TYPE, _GRID_WIDTH) bool PASTE(_NAME, _empty);
-    COLUMN_LIST
-    #undef COLUMN
+    struct {
+        #define COLUMN(_NAME, _TYPE, _GRID_WIDTH) bool _NAME;
+        COLUMN_LIST
+        #undef COLUMN
+    } _empty;
 };
+
+struct api;
+struct api {
+    int8_t (* const next)(struct api * api, void * row_out, bool * empty_out);
+    int8_t (* const grid)(struct api * api, const void * row, const bool * empty);
+    void (* const write)(struct api * api, const char * str);
+
+    char _rust_owned_data[];
+};
+
+// Exports
+void run(struct api * api);
 
 #define COLUMN(_NAME, _TYPE, _GRID_WIDTH) (struct column) { .name = STRINGIFY(_NAME), .cell_type = PASTE(TYPE_, _TYPE), .grid_width = _GRID_WIDTH},
 const struct column columns[] = {
@@ -96,20 +104,18 @@ const struct column columns[] = {
 #undef COLUMN
 const size_t columns_count = sizeof(columns) / sizeof(columns[0]);
 
-struct api;
-struct api {
-    struct cell * (* const next)(struct api * api);
-    int8_t (* const grid)(struct api * api, const struct cell * cells);
-    void (* const write)(struct api * api, const char * str);
-
-    char _rust_owned_data[];
-};
-
-// Exports
-//void setup(size_t columns_count, struct column * columns);
-void run(struct api * api);
-
 // ---
+static bool
+api_next(struct api * const api, struct row * const row) {
+    return api->next(api, row, (bool *) &row->_empty);
+}
+
+static void
+api_grid(struct api * const api, struct row const * const row) {
+    api->grid(api, row, (bool *) &row->_empty);
+}
+
+#define printf(...) api_printf(api, ## __VA_ARGS__)
 static void
 api_printf(struct api * const api, const char * const fmt, ...) {
     va_list vargs;
@@ -138,7 +144,5 @@ api_printf(struct api * const api, const char * const fmt, ...) {
     buf[buflen-1] = '\0';
     api->write(api, buf);
 }
-
-#define printf(...) api_printf(api, ## __VA_ARGS__)
 
 #endif
