@@ -25,20 +25,10 @@
     TYPE(DOUBLE, 3) \
 
 #define _TYPE_CTYPE_TEXT    const char *
-#define _TYPE_LOWER_TEXT    text
 #define _TYPE_CTYPE_TIME    long
-#define _TYPE_LOWER_TIME    time
 #define _TYPE_CTYPE_LONG    long
-#define _TYPE_LOWER_LONG    long
 #define _TYPE_CTYPE_DOUBLE  double
-#define _TYPE_LOWER_DOUBLE  double
 #define _TYPE_CTYPE(t) PASTE(_TYPE_CTYPE_, t)
-#define _TYPE_LOWER(t) PASTE(_TYPE_LOWER_, t)
-// TODO: Have rust do the capitalization
-#define Text TEXT
-#define Long LONG
-#define Time TIME
-#define Double DOUBLE
 
 enum cell_type {
     #define TYPE(t, n) PASTE(TYPE_, t) = n,
@@ -46,13 +36,9 @@ enum cell_type {
     #undef TYPE
 };
 
-union cell_value {
-    uint64_t _placeholder;
-    #define TYPE(t, n) _TYPE_CTYPE(t) PASTE(cell_, _TYPE_LOWER(t));
-    TYPE_LIST
-    #undef TYPE
-};
-//_Static_assert(sizeof(union cell) == sizeof(uint64_t));
+#define TYPE(t, _n) _Static_assert(sizeof(_TYPE_CTYPE(t)) <= sizeof(uint64_t), "Each value type must be less than 8 bytes: " t " with type " STRINGIFY(_TYPE_CTYPE(t)) " is too big");
+TYPE_LIST
+#undef TYPE
 
 static inline const char * strtype(enum cell_type type) {
     switch (type) {
@@ -69,7 +55,6 @@ struct column {
     int16_t grid_width;
 };
 
-#define CELL_DEREF(cell, type) (cell.PASTE(cell_, _TYPE_LOWER(type)))
 #define GRID_WIDTH(n)   (n)
 #define GRID_HIDDEN     -1
 #define GRID_AUTO       0
@@ -104,15 +89,15 @@ const struct column columns[] = {
 #undef COLUMN
 const size_t columns_count = sizeof(columns) / sizeof(columns[0]);
 
-// ---
+// Functions to use inside script
 static bool
 api_next(struct api * const api, struct row * const row) {
     return api->next(api, row, (bool *) &row->_empty);
 }
 
-static void
+static bool
 api_grid(struct api * const api, struct row const * const row) {
-    api->grid(api, row, (bool *) &row->_empty);
+    return api->grid(api, row, (bool *) &row->_empty);
 }
 
 #define printf(...) api_printf(api, ## __VA_ARGS__)
